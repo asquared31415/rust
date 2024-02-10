@@ -137,8 +137,8 @@ pub fn check(path: &Path, bad: &mut bool) {
             }
             "rs" => {
                 // FIXME (ui_test): make this configurable somehow
-                let mode = HeaderCheckMode::Error;
-                // let mode = HeaderCheckMode::Fix;
+                // let mode = HeaderCheckMode::Error;
+                let mode = HeaderCheckMode::Fix;
                 check_ui_test_headers(bad, file_path, mode);
             }
             _ => {}
@@ -242,8 +242,21 @@ fn fix_header_errors(file_path: &Path, bad_lines: Vec<HeaderAction>) -> io::Resu
                     );
                     Some((header_action.line_num(), new_line))
                 }
+                LineAction::InsertLine { insert_line } => {
+                    // Inserting the line after the current line is adding the line and a newline to the existing line.
+                    let mut new_line = header_action.line().to_string();
+                    new_line.push_str(insert_line);
+                    new_line.push('\n');
+
+                    Some((header_action.line_num(), new_line))
+                }
                 LineAction::Error { .. } => {
                     emit_error(file_path, &header_action);
+                    // No line to replace
+                    None
+                }
+                LineAction::Warn { message } => {
+                    // eprintln!("WARNING: {}", message);
                     // No line to replace
                     None
                 }

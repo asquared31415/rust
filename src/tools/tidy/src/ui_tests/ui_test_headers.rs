@@ -29,7 +29,9 @@ pub(super) fn check_file_headers(file_path: &Path) -> Result<(), HeaderError> {
 
     test_common::iter_header(file_path, rdr, &mut |comment| {
         let line_num = comment.line_num();
+
         for &directive in KNOWN_DIRECTIVES {
+            let line = comment.full_line().to_owned();
             let directive_match = match_comment(comment, directive);
             // Only one directive will ever match a line, so any path that matches should break
             match directive_match {
@@ -40,7 +42,7 @@ pub(super) fn check_file_headers(file_path: &Path) -> Result<(), HeaderError> {
                 DirectiveMatchResult::UseUiTestComment => {
                     errors.push(HeaderAction {
                         line_num,
-                        line: comment.full_line().to_owned(),
+                        line,
                         action: LineAction::UseUiTestComment,
                     });
                     break;
@@ -48,7 +50,7 @@ pub(super) fn check_file_headers(file_path: &Path) -> Result<(), HeaderError> {
                 DirectiveMatchResult::MigrateToUiTest => {
                     errors.push(HeaderAction {
                         line_num,
-                        line: comment.full_line().to_owned(),
+                        line,
                         action: LineAction::MigrateToUiTest {
                             compiletest_name: directive.compiletest_name().to_owned(),
                             ui_test_name: directive.ui_test_name().unwrap().to_owned(),
@@ -59,7 +61,7 @@ pub(super) fn check_file_headers(file_path: &Path) -> Result<(), HeaderError> {
                 DirectiveMatchResult::UseUITestName => {
                     errors.push(HeaderAction {
                         line_num,
-                        line: comment.full_line().to_owned(),
+                        line,
                         action: LineAction::UseUITestName {
                             compiletest_name: directive.compiletest_name().to_owned(),
                             ui_test_name: directive.ui_test_name().unwrap().to_owned(),
@@ -70,34 +72,46 @@ pub(super) fn check_file_headers(file_path: &Path) -> Result<(), HeaderError> {
             }
         }
 
-        match check_condition(&comment) {
-            Ok(_) => {}
-            Err(ConditionError::ConvertToUiTest { compiletest_name, ui_test_name }) => {
-                errors.push(HeaderAction {
+        for err in check_condition(&comment) {
+            let line = comment.full_line().to_owned();
+            match err {
+                ConditionError::ConvertToUiTest { compiletest_name, ui_test_name } => {
+                    errors.push(HeaderAction {
+                        line_num,
+                        line,
+                        action: LineAction::MigrateToUiTest { compiletest_name, ui_test_name },
+                    })
+                }
+                ConditionError::UiTestUnknownTarget { target_substr } => {
+                    errors.push(HeaderAction {
+                        line_num,
+                        line,
+                        action: LineAction::Error {
+                            message: format!("invalid target substring: {}", target_substr),
+                        },
+                    })
+                }
+                ConditionError::AddCondition { insert_line } => errors.push(HeaderAction {
                     line_num,
-                    line: comment.full_line().to_owned(),
-                    action: LineAction::MigrateToUiTest { compiletest_name, ui_test_name },
-                })
-            }
-            Err(ConditionError::UiTestUnknownTarget { target_substr }) => {
-                errors.push(HeaderAction {
+                    line,
+                    action: LineAction::InsertLine { insert_line },
+                }),
+                ConditionError::UseUiTestComment => errors.push(HeaderAction {
                     line_num,
-                    line: comment.full_line().to_owned(),
-                    action: LineAction::Error {
-                        message: format!("invalid target substring: {}", target_substr),
-                    },
-                })
+                    line,
+                    action: LineAction::UseUiTestComment,
+                }),
+                ConditionError::UnknownCondition { name } => errors.push(HeaderAction {
+                    line_num,
+                    line,
+                    action: LineAction::Error { message: format!("unknown condition {}", name) },
+                }),
+                ConditionError::UnsupportedCondition { name } => errors.push(HeaderAction {
+                    line_num,
+                    line,
+                    action: LineAction::Warn { message: format!("unsupported condition {}", name) },
+                }),
             }
-            Err(ConditionError::UseUiTestComment) => errors.push(HeaderAction {
-                line_num,
-                line: comment.full_line().to_owned(),
-                action: LineAction::UseUiTestComment,
-            }),
-            Err(ConditionError::UnknownCondition { name }) => errors.push(HeaderAction {
-                line_num,
-                line: comment.full_line().to_owned(),
-                action: LineAction::Error { message: format!("unknown condition {}", name) },
-            }),
         }
     });
 
@@ -184,52 +198,79 @@ enum ConditionError {
     /// The line should be converted to a ui_test style comment with no other changes.
     UseUiTestComment,
     /// The line should be converted to a ui_test style comment and update its name.
-    ConvertToUiTest { compiletest_name: String, ui_test_name: String },
+    ConvertToUiTest {
+        compiletest_name: String,
+        ui_test_name: String,
+    },
+    /// Add a new condition with the line specified
+    AddCondition {
+        insert_line: String,
+    },
     /// The target substring in the comment is not known.
-    UiTestUnknownTarget { target_substr: String },
+    UiTestUnknownTarget {
+        target_substr: String,
+    },
     /// The comment looked like a condition, but was not known.
-    UnknownCondition { name: String },
+    UnknownCondition {
+        name: String,
+    },
+    UnsupportedCondition {
+        name: String,
+    },
 }
 
 /// Checks that a test comment uses the ui_test style only or ignore directives, and that
 /// the value would be known to ui_test at the time of writing (2023-08-13).
-fn check_condition(comment: &TestComment<'_>) -> Result<(), ConditionError> {
+fn check_condition(comment: &TestComment<'_>) -> Vec<ConditionError> {
     let comment_kind = comment.comment();
     // This code only cares about checking that conditions parse, skip non-conditions.
     let Some(condition) = comment_kind
         .parse_name_comment()
         .and_then(|(name, _)| name.strip_prefix("only-").or_else(|| name.strip_prefix("ignore-")))
     else {
-        return Ok(());
+        return vec![];
     };
+
     match comment.comment() {
         CommentKind::Compiletest(_) => {
             if condition.ends_with("bit") {
                 // ui_test accepts the same `Nbit` comments as compiletest.
-                Err(ConditionError::UseUiTestComment)
+                vec![ConditionError::UseUiTestComment]
+            } else if condition == "emscripten" {
+                // emscripten also implies wasm32-unknown-unknown, but ui_test doesn't support
+                // that, so it needs to be added manually.
+                vec![
+                    ConditionError::ConvertToUiTest {
+                        compiletest_name: condition.to_owned(),
+                        ui_test_name: condition.to_owned(),
+                    },
+                    ConditionError::AddCondition {
+                        insert_line: String::from("//@ignore-wasm32-unknown-unknown"),
+                    },
+                ]
             } else if let Ok(idx) = KNOWN_TARGET_COMPONENTS.binary_search(&condition) {
                 // Targets that are known to ui_test should be converted to ui_test style target conditions.
-                Err(ConditionError::ConvertToUiTest {
+                vec![ConditionError::ConvertToUiTest {
                     compiletest_name: condition.to_owned(),
                     // The index is contained within the array, it was just checked.
                     ui_test_name: format!("target-{}", KNOWN_TARGET_COMPONENTS[idx]),
-                })
+                }]
             } else if condition == "test" {
-                Err(ConditionError::UseUiTestComment)
+                vec![ConditionError::UseUiTestComment]
             } else if condition == "wasm32-bare" {
                 // wasm32-bare is an alias for wasm32-unknown-unknown
-                Err(ConditionError::ConvertToUiTest {
+                vec![ConditionError::ConvertToUiTest {
                     compiletest_name: String::from("wasm32-bare"),
                     ui_test_name: String::from("target-wasm32-unknown-unknown"),
-                })
+                }]
             } else if condition.starts_with("tidy-") {
                 // Ignore tidy directives
-                Ok(())
+                vec![]
             } else if UNSUPPORTED_CONDITIONS.contains(&condition) {
-                Ok(())
+                vec![ConditionError::UnsupportedCondition { name: condition.to_owned() }]
             } else {
                 // Unknown only/ignore directive, or the target is not known.
-                Err(ConditionError::UnknownCondition { name: condition.to_owned() })
+                vec![ConditionError::UnknownCondition { name: condition.to_owned() }]
             }
         }
 
@@ -243,18 +284,18 @@ fn check_condition(comment: &TestComment<'_>) -> Result<(), ConditionError> {
                 // Note: this is *not* something that ui_test does, but it is here to aid in
                 // transitioning from compiletest, which does check all known targets.
                 if let Ok(_) = KNOWN_TARGET_COMPONENTS.binary_search(&target_substr) {
-                    Ok(())
+                    vec![]
                 } else {
-                    Err(ConditionError::UiTestUnknownTarget {
+                    vec![ConditionError::UiTestUnknownTarget {
                         target_substr: target_substr.to_owned(),
-                    })
+                    }]
                 }
             } else {
                 // The comment was either a known condition that does not need additional
                 // validation or the comment was an invalid condition. The test parser will either
                 // pass or fail on this comment when it actually tries to handle the tests, so
                 // there is no need to do anything here.
-                Ok(())
+                vec![]
             }
         }
     }
@@ -271,8 +312,12 @@ pub(super) enum LineAction {
     /// The directive was a ui_test style directive, but it was using the compiletest style name.
     /// It must change its name.
     UseUITestName { compiletest_name: String, ui_test_name: String },
+    /// Insert this line *after* the line number specified
+    InsertLine { insert_line: String },
     /// This cannot be automatically fixed, just emit an error.
     Error { message: String },
+    /// Cannot be automatically fixed, but only emit a warning.
+    Warn { message: String },
 }
 
 #[derive(Debug)]
@@ -305,10 +350,12 @@ impl HeaderAction {
                     ui_test_name, compiletest_name
                 )
             }
+            LineAction::InsertLine { insert_line } => todo!(),
             LineAction::UseUITestName { compiletest_name, ui_test_name } => {
                 format!("use the the updated name {} instead of {}", ui_test_name, compiletest_name)
             }
             LineAction::Error { message } => message.clone(),
+            LineAction::Warn { message } => message.clone(),
         }
     }
 }
